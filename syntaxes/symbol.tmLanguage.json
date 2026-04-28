@@ -1,0 +1,267 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Symbol",
+    "scopeName": "source.sym",
+    "patterns": [
+        { "include": "#comment-block" },
+        { "include": "#comment-line" },
+        { "include": "#import-statement" },
+        { "include": "#export-statement" },
+        { "include": "#interface-declaration" },
+        { "include": "#keywords" },
+        { "include": "#built-in-types" },
+        { "include": "#constants" },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#function-call" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+    ],
+    "repository": {
+        "comment-line": {
+            "name": "comment.line.double-slash.symbol",
+            "match": "//.*$"
+        },
+        "comment-block": {
+            "name": "comment.block.symbol",
+            "begin": "/\\*",
+            "end": "\\*/",
+            "beginCaptures": {
+                "0": { "name": "punctuation.definition.comment.begin.symbol" }
+            },
+            "endCaptures": {
+                "0": { "name": "punctuation.definition.comment.end.symbol" }
+            },
+            "patterns": [
+                { "include": "#comment-block" }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.symbol",
+                    "match": "\\b(if|else|for|while|do|return|break|continue|switch|case|default|await)\\b"
+                },
+                {
+                    "name": "storage.type.symbol",
+                    "match": "\\b(var|const)\\b"
+                },
+                {
+                    "name": "keyword.declaration.interface.symbol",
+                    "match": "\\binterface\\b"
+                },
+                {
+                    "name": "storage.modifier.async.symbol",
+                    "match": "\\basync\\b"
+                },
+                {
+                    "name": "keyword.control.import.symbol",
+                    "match": "\\b(import|from|export)\\b"
+                }
+            ]
+        },
+        "built-in-types": {
+            "name": "support.type.built-in.symbol",
+            "match": "\\b(int|float|string|bool|any)\\b"
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "constant.language.boolean.true.symbol",
+                    "match": "\\btrue\\b"
+                },
+                {
+                    "name": "constant.language.boolean.false.symbol",
+                    "match": "\\bfalse\\b"
+                },
+                {
+                    "name": "constant.language.null.symbol",
+                    "match": "\\bnull\\b"
+                }
+            ]
+        },
+        "strings": {
+            "patterns": [
+                {
+                    "name": "string.quoted.double.symbol",
+                    "begin": "\"",
+                    "end": "\"",
+                    "beginCaptures": {
+                        "0": {
+                            "name": "punctuation.definition.string.begin.symbol"
+                        }
+                    },
+                    "endCaptures": {
+                        "0": {
+                            "name": "punctuation.definition.string.end.symbol"
+                        }
+                    },
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.symbol",
+                            "match": "\\\\."
+                        },
+                        {
+                            "name": "meta.template.expression.symbol",
+                            "begin": "\\${",
+                            "end": "}",
+                            "beginCaptures": {
+                                "0": {
+                                    "name": "punctuation.section.embedded.begin.symbol"
+                                }
+                            },
+                            "endCaptures": {
+                                "0": {
+                                    "name": "punctuation.section.embedded.end.symbol"
+                                }
+                            },
+                            "patterns": [
+                                { "include": "#keywords" },
+                                { "include": "#built-in-types" },
+                                { "include": "#constants" },
+                                { "include": "#numbers" },
+                                { "include": "#operators" },
+                                { "include": "#function-call" }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "string.quoted.single.symbol",
+                    "begin": "'",
+                    "end": "'",
+                    "beginCaptures": {
+                        "0": {
+                            "name": "punctuation.definition.string.begin.symbol"
+                        }
+                    },
+                    "endCaptures": {
+                        "0": {
+                            "name": "punctuation.definition.string.end.symbol"
+                        }
+                    },
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.symbol",
+                            "match": "\\\\."
+                        }
+                    ]
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.float.symbol",
+                    "match": "-?\\b[0-9]+\\.[0-9]+\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.symbol",
+                    "match": "-?\\b[0-9]+\\b"
+                }
+            ]
+        },
+        "import-statement": {
+            "name": "meta.import.symbol",
+            "match": "\\b(import)\\s*(\\{[^}]*\\})\\s*(from)\\s*(\"[^\"]*\")",
+            "captures": {
+                "1": { "name": "keyword.control.import.symbol" },
+                "2": { "name": "meta.import.names.symbol" },
+                "3": { "name": "keyword.control.from.symbol" },
+                "4": { "name": "string.quoted.double.symbol" }
+            }
+        },
+        "export-statement": {
+            "name": "meta.export.symbol",
+            "match": "\\b(export)\\s*(\\{[^}]*\\})",
+            "captures": {
+                "1": { "name": "keyword.control.export.symbol" },
+                "2": { "name": "meta.export.names.symbol" }
+            }
+        },
+        "interface-declaration": {
+            "match": "\\b(interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+            "captures": {
+                "1": { "name": "keyword.declaration.interface.symbol" },
+                "2": { "name": "entity.name.type.interface.symbol" }
+            }
+        },
+        "function-call": {
+            "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+            "captures": {
+                "1": { "name": "entity.name.function.symbol" }
+            }
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.increment.symbol",
+                    "match": "\\+\\+|--"
+                },
+                {
+                    "name": "keyword.operator.assignment.compound.symbol",
+                    "match": "\\+=|-=|\\*=|/=|%="
+                },
+                {
+                    "name": "keyword.operator.comparison.symbol",
+                    "match": "==|!=|<=|>=|<|>"
+                },
+                {
+                    "name": "keyword.operator.logical.symbol",
+                    "match": "&&|\\|\\||!"
+                },
+                {
+                    "name": "keyword.operator.bitwise.symbol",
+                    "match": "<<|>>|&|\\||\\^|~"
+                },
+                {
+                    "name": "keyword.operator.arithmetic.symbol",
+                    "match": "[+\\-*/%]"
+                },
+                {
+                    "name": "keyword.operator.ternary.symbol",
+                    "match": "\\?"
+                },
+                {
+                    "name": "keyword.operator.assignment.symbol",
+                    "match": "="
+                }
+            ]
+        },
+        "punctuation": {
+            "patterns": [
+                {
+                    "name": "punctuation.definition.block.begin.symbol",
+                    "match": "\\{"
+                },
+                {
+                    "name": "punctuation.definition.block.end.symbol",
+                    "match": "\\}"
+                },
+                {
+                    "name": "punctuation.definition.array.begin.symbol",
+                    "match": "\\["
+                },
+                {
+                    "name": "punctuation.definition.array.end.symbol",
+                    "match": "\\]"
+                },
+                {
+                    "name": "punctuation.definition.parameters.begin.symbol",
+                    "match": "\\("
+                },
+                {
+                    "name": "punctuation.definition.parameters.end.symbol",
+                    "match": "\\)"
+                },
+                { "name": "punctuation.separator.comma.symbol", "match": "," },
+                {
+                    "name": "punctuation.terminator.statement.symbol",
+                    "match": ";"
+                },
+                { "name": "punctuation.accessor.dot.symbol", "match": "\\." },
+                { "name": "punctuation.separator.colon.symbol", "match": ":" }
+            ]
+        }
+    }
+}

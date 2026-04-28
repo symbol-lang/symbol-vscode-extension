@@ -1,0 +1,49 @@
+{
+  "name": "symbol-language",
+  "displayName": "Symbol Language",
+  "description": "Syntax highlighting and error diagnostics for the Symbol (.sym) language",
+  "version": "0.0.1",
+  "publisher": "symbol-lang",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./client/out/extension",
+  "contributes": {
+    "languages": [{
+      "id": "symbol",
+      "aliases": ["Symbol", "symbol"],
+      "extensions": [".sym"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "symbol",
+      "scopeName": "source.sym",
+      "path": "./syntaxes/symbol.tmLanguage.json"
+    }],
+    "configuration": {
+      "type": "object",
+      "title": "Symbol Language",
+      "properties": {
+        "symbol.compilerPath": {
+          "type": "string",
+          "default": "symboli",
+          "description": "Path to the symboli compiler executable"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -b",
+    "watch": "tsc -b -w",
+    "postinstall": "cd client && npm install && cd ../server && npm install && cd .."
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
+  }
+}
