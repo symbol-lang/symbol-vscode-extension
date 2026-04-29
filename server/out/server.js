@@ -29,7 +29,7 @@ documents.onDidClose(event => {
 });
 // ── Builtin type signatures ───────────────────────────────────────
 const BUILTIN_TYPES = {
-    console: '{ write: null (), writeln: null (), read: string (), readln: string () }',
+    console: '{ write: null (...any[]), writeln: null (...any[]), read: string (), readln: string () }',
     system: '{ quit: null (int), args: string[] () }',
     array: '{ push: any[] (any[], any), pop: any (any[]), length: int (any[]), get: any (any[], int), set: null (any[], int, any), sort: any[] (any[]), copy: any[] (any[]) }',
     struct: '{ set: any (any, string, any), get: any (any, string), delete: null (any, string), clear: null (any), get_keys: string[] (any), get_values: any[] (any) }',
@@ -71,8 +71,9 @@ function collectExplicitTypes(node, types) {
     if (node.kind === 'lambda') {
         const lm = node;
         for (const p of lm.params) {
+            const name = p.name.startsWith('...') ? p.name.slice(3) : p.name;
             if (p.type)
-                types.set(p.name, p.type);
+                types.set(name, p.type);
         }
         for (const stmt of lm.body)
             collectExplicitTypes(stmt, types);
@@ -108,13 +109,20 @@ function resolveCallTypes(node, types) {
     if (node.kind === 'var_decl') {
         const vd = node;
         if (!vd.vartype && vd.init) {
-            const callee = calleeNameOf(vd.init);
-            if (callee) {
-                const funcType = types.get(callee);
-                if (funcType) {
-                    const ret = extractReturnType(funcType);
-                    if (ret)
-                        types.set(vd.name, ret);
+            if (vd.init.kind === 'var_ref') {
+                const refType = types.get(vd.init.name);
+                if (refType)
+                    types.set(vd.name, refType);
+            }
+            else {
+                const callee = calleeNameOf(vd.init);
+                if (callee) {
+                    const funcType = types.get(callee);
+                    if (funcType) {
+                        const ret = extractReturnType(funcType);
+                        if (ret)
+                            types.set(vd.name, ret);
+                    }
                 }
             }
         }
@@ -221,7 +229,11 @@ function inferReturnTypes(node, types) {
             const lm = vd.init;
             if (!lm.ret_type) {
                 const ret = inferLambdaReturnType(lm, types);
-                const params = lm.params.map(p => p.type ?? 'any').join(', ');
+                const params = lm.params.map((p, i) => {
+                    const isLast = i === lm.params.length - 1;
+                    const prefix = lm.is_variadic && isLast ? '...' : '';
+                    return prefix + (p.type ?? 'any');
+                }).join(', ');
                 types.set(vd.name, `${ret} (${params})`);
             }
         }
@@ -233,12 +245,109 @@ function inferReturnTypes(node, types) {
         return;
     }
 }
-function collectTypes(ast) {
-    const types = new Map(Object.entries(BUILTIN_TYPES));
+function collectTypes(ast, importedBuiltins) {
+    const builtins = importedBuiltins
+        ? Object.fromEntries(Object.entries(BUILTIN_TYPES).filter(([k]) => importedBuiltins.has(k)))
+        : BUILTIN_TYPES;
+    const types = new Map(Object.entries(builtins));
     collectExplicitTypes(ast, types); // pass 1: explicit types + params
     inferReturnTypes(ast, types); // pass 2: infer lambda return types
     resolveCallTypes(ast, types); // pass 3: resolve call result types
     return types;
+}
+// Strip // and /* */ comments (nested block comments supported).
+// Replaces comment characters with spaces so line/col positions are preserved.
+// String literals are passed through unchanged to avoid false matches inside them.
+function stripComments(source) {
+    const out = [];
+    let i = 0;
+    const len = source.length;
+    while (i < len) {
+        // Line comment
+        if (source[i] === '/' && source[i + 1] === '/') {
+            while (i < len && source[i] !== '\n') {
+                out.push(' ');
+                i++;
+            }
+            continue;
+        }
+        // Block comment with nesting
+        if (source[i] === '/' && source[i + 1] === '*') {
+            out.push(' ', ' ');
+            i += 2;
+            let depth = 1;
+            while (i < len && depth > 0) {
+                if (source[i] === '/' && source[i + 1] === '*') {
+                    out.push(' ', ' ');
+                    i += 2;
+                    depth++;
+                }
+                else if (source[i] === '*' && source[i + 1] === '/') {
+                    out.push(' ', ' ');
+                    i += 2;
+                    depth--;
+                }
+                else {
+                    out.push(source[i] === '\n' ? '\n' : ' ');
+                    i++;
+                }
+            }
+            continue;
+        }
+        // String literal — pass through as-is
+        if (source[i] === '"' || source[i] === "'") {
+            const q = source[i];
+            out.push(source[i++]);
+            while (i < len && source[i] !== q) {
+                if (source[i] === '\\')
+                    out.push(source[i++]);
+                out.push(source[i++]);
+            }
+            if (i < len)
+                out.push(source[i++]);
+            continue;
+        }
+        out.push(source[i++]);
+    }
+    return out.join('');
+}
+// Parse `import { a, b } from "symbol"` statements and return imported names.
+function parseSymbolImports(stripped) {
+    const imported = new Set();
+    const importRe = /import\s*\{([^}]+)\}\s*from\s*["'][^"']+["']/g;
+    let m;
+    while ((m = importRe.exec(stripped)) !== null) {
+        for (const name of m[1].split(',')) {
+            const trimmed = name.trim();
+            if (trimmed)
+                imported.add(trimmed);
+        }
+    }
+    return imported;
+}
+// Report uses of symbol builtins that weren't imported.
+function checkUnimportedBuiltins(stripped, imported, document) {
+    const diagnostics = [];
+    const lines = stripped.split('\n');
+    for (const name of Object.keys(BUILTIN_TYPES)) {
+        if (imported.has(name))
+            continue;
+        const usageRe = new RegExp(`\\b${name}\\b`, 'g');
+        for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+            const lineText = lines[lineIdx];
+            const lineNoStrings = lineText.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, m => ' '.repeat(m.length));
+            let match;
+            usageRe.lastIndex = 0;
+            while ((match = usageRe.exec(lineNoStrings)) !== null) {
+                const col = match.index;
+                const charAfter = lineNoStrings[col + name.length];
+                if (charAfter !== '.' && charAfter !== '(')
+                    continue;
+                diagnostics.push(buildDiag(lineIdx, col, `'${name}' is not imported from "symbol"`, document));
+            }
+        }
+    }
+    return diagnostics;
 }
 // ── Document validation + AST extraction ──────────────────────────
 function validateDocument(document) {
@@ -259,7 +368,10 @@ function validateDocument(document) {
         if (astResult.status === 0 && astResult.stdout) {
             try {
                 const ast = JSON.parse(astResult.stdout);
-                docTypes.set(document.uri, collectTypes(ast));
+                const stripped = stripComments(document.getText());
+                const importedBuiltins = parseSymbolImports(stripped);
+                docTypes.set(document.uri, collectTypes(ast, importedBuiltins));
+                diagnostics.push(...checkUnimportedBuiltins(stripped, importedBuiltins, document));
             }
             catch {
                 // AST parse failed — keep existing types
