@@ -14,6 +14,7 @@ let compilerPath = 'symboli';
 const docTypes = new Map();
 connection.onInitialize((params) => {
     compilerPath = params.initializationOptions?.compilerPath ?? 'symboli';
+    loadBuiltinTypes(compilerPath);
     return {
         capabilities: {
             textDocumentSync: node_1.TextDocumentSyncKind.Incremental,
@@ -28,7 +29,7 @@ documents.onDidClose(event => {
     docTypes.delete(event.document.uri);
 });
 // ── Builtin type signatures ───────────────────────────────────────
-const BUILTIN_TYPES = {
+const DEFAULT_BUILTIN_TYPES = {
     console: '{ write: null (...any[]), writeln: null (...any[]), read: string (), readln: string () }',
     system: '{ quit: null (int), args: string[] () }',
     array: '{ push: any[] (any[], any), pop: any (any[]), length: int (any[]), get: any (any[], int), set: null (any[], int, any), sort: any[] (any[]), copy: any[] (any[]) }',
@@ -37,7 +38,23 @@ const BUILTIN_TYPES = {
     cast: '{ to_bool: bool (any), to_string: string (any), to_int: int (any), to_float: float (any) }',
     string: '{ length: int (string), lowercase: string (string), uppercase: string (string), trim: string (string), split: string[] (string, string), is_bool: bool (string), is_int: bool (string), is_float: bool (string) }',
     type: '{ of: string (any) }',
+    file: '{ exist: bool (string), create: null (string), delete: null (string), open: int | null (string), close: null (int), move: null (string, string), copy: null (string, string), read: any (string), write: null (int, string), append: null (int, string), read_bytes: int[] (int), write_bytes: null (int, int[]), size: int (string), mkdir: null (string) }',
 };
+let builtinTypes = { ...DEFAULT_BUILTIN_TYPES };
+function loadBuiltinTypes(compiler) {
+    try {
+        const result = (0, child_process_1.spawnSync)(compiler, ['--dump-builtins'], { encoding: 'utf8', timeout: 5000 });
+        if (result.status === 0 && result.stdout) {
+            const parsed = JSON.parse(result.stdout);
+            if (parsed && typeof parsed === 'object') {
+                builtinTypes = parsed;
+                return;
+            }
+        }
+    }
+    catch { /* fall through to defaults */ }
+    builtinTypes = { ...DEFAULT_BUILTIN_TYPES };
+}
 // ── AST traversal ─────────────────────────────────────────────────
 // Returns the return type portion of a function type string.
 // "null (string, bool)" → "null"
@@ -47,6 +64,25 @@ function extractReturnType(funcType) {
     if (idx === -1)
         return null;
     return funcType.slice(0, idx);
+}
+// Looks up method return type inside a struct type string.
+// structType = "{ open: any (string), close: null (int), ... }"
+// extractMemberReturnType(structType, "open") → "any"
+function extractMemberReturnType(structType, member) {
+    const re = new RegExp(`\\b${member}:\\s*(.*?)(?=,\\s*\\w+:|\\s*\\})`);
+    const m = structType.match(re);
+    if (!m)
+        return null;
+    return extractReturnType(m[1].trim());
+}
+// Extracts the full type string (signature) of a member from a struct type string.
+// extractMemberType("{ write: null (...any[]), readln: string () }", "write") → "null (...any[])"
+function extractMemberType(structType, member) {
+    const re = new RegExp(`\\b${member}:\\s*(.*?)(?=,\\s*\\w+:|\\s*\\})`);
+    const m = structType.match(re);
+    if (!m)
+        return null;
+    return m[1].trim();
 }
 // Returns the direct callee name if the call is a simple var_ref call.
 function calleeNameOf(node) {
@@ -124,6 +160,20 @@ function resolveCallTypes(node, types) {
                             types.set(vd.name, ret);
                     }
                 }
+                else if (vd.init.kind === 'call') {
+                    const callNode = vd.init;
+                    if (callNode.func?.kind === 'member_access') {
+                        const ma = callNode.func;
+                        if (ma.object?.kind === 'var_ref') {
+                            const objType = types.get(ma.object.name);
+                            if (objType) {
+                                const ret = extractMemberReturnType(objType, ma.member);
+                                if (ret)
+                                    types.set(vd.name, ret);
+                            }
+                        }
+                    }
+                }
             }
         }
         resolveCallTypes(vd.init, types);
@@ -176,6 +226,15 @@ function inferExprType(node, types) {
                 const ft = types.get(callee);
                 if (ft)
                     return extractReturnType(ft);
+            }
+            const callNode = node;
+            if (callNode.func?.kind === 'member_access') {
+                const ma = callNode.func;
+                if (ma.object?.kind === 'var_ref') {
+                    const objType = types.get(ma.object.name);
+                    if (objType)
+                        return extractMemberReturnType(objType, ma.member);
+                }
             }
             return null;
         }
@@ -247,8 +306,8 @@ function inferReturnTypes(node, types) {
 }
 function collectTypes(ast, importedBuiltins) {
     const builtins = importedBuiltins
-        ? Object.fromEntries(Object.entries(BUILTIN_TYPES).filter(([k]) => importedBuiltins.has(k)))
-        : BUILTIN_TYPES;
+        ? Object.fromEntries(Object.entries(builtinTypes).filter(([k]) => importedBuiltins.has(k)))
+        : builtinTypes;
     const types = new Map(Object.entries(builtins));
     collectExplicitTypes(ast, types); // pass 1: explicit types + params
     inferReturnTypes(ast, types); // pass 2: infer lambda return types
@@ -325,17 +384,70 @@ function parseSymbolImports(stripped) {
     }
     return imported;
 }
+// Replace string literal content with spaces, but preserve ${...} interpolation bodies
+// so that builtin usage inside interpolations is still checked.
+function maskStringLiterals(line) {
+    const out = [];
+    let i = 0;
+    while (i < line.length) {
+        const ch = line[i];
+        if (ch === '"' || ch === "'") {
+            const q = ch;
+            out.push(' ');
+            i++;
+            while (i < line.length && line[i] !== q) {
+                if (line[i] === '\\') {
+                    out.push(' ', ' ');
+                    i += 2;
+                }
+                else if (q === '"' && line[i] === '$' && line[i + 1] === '{') {
+                    out.push(' ', ' ');
+                    i += 2;
+                    let depth = 1;
+                    while (i < line.length && depth > 0) {
+                        if (line[i] === '{')
+                            depth++;
+                        else if (line[i] === '}') {
+                            depth--;
+                            if (depth === 0)
+                                break;
+                        }
+                        out.push(line[i]);
+                        i++;
+                    }
+                    if (i < line.length) {
+                        out.push(' ');
+                        i++;
+                    }
+                }
+                else {
+                    out.push(' ');
+                    i++;
+                }
+            }
+            if (i < line.length) {
+                out.push(' ');
+                i++;
+            }
+        }
+        else {
+            out.push(ch);
+            i++;
+        }
+    }
+    return out.join('');
+}
 // Report uses of symbol builtins that weren't imported.
 function checkUnimportedBuiltins(stripped, imported, document) {
     const diagnostics = [];
     const lines = stripped.split('\n');
-    for (const name of Object.keys(BUILTIN_TYPES)) {
+    for (const name of Object.keys(builtinTypes)) {
         if (imported.has(name))
             continue;
         const usageRe = new RegExp(`\\b${name}\\b`, 'g');
         for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
             const lineText = lines[lineIdx];
-            const lineNoStrings = lineText.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, m => ' '.repeat(m.length));
+            const lineNoStrings = maskStringLiterals(lineText);
             let match;
             usageRe.lastIndex = 0;
             while ((match = usageRe.exec(lineNoStrings)) !== null) {
@@ -347,6 +459,77 @@ function checkUnimportedBuiltins(stripped, imported, document) {
             }
         }
     }
+    return diagnostics;
+}
+// ── Missing return check ──────────────────────────────────────────
+// Recursively check whether a body contains any return statement.
+function hasReturn(body) {
+    for (const stmt of body) {
+        if (stmt.kind === 'return')
+            return true;
+        for (const key of ['then_branch', 'else_branch', 'body', 'true_branch', 'false_branch']) {
+            const child = stmt[key];
+            if (!child)
+                continue;
+            if (child.kind === 'return')
+                return true;
+            if (child.kind === 'program' && Array.isArray(child['body'])) {
+                if (hasReturn(child['body']))
+                    return true;
+            }
+            else if (Array.isArray(child)) {
+                if (hasReturn(child))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+// Walk the AST and report var_decls whose lambda body has no return
+// despite a non-null return type in the annotation.
+function checkMissingReturns(node, document) {
+    const diagnostics = [];
+    function walk(n) {
+        if (!n)
+            return;
+        if (n.kind === 'var_decl') {
+            const vd = n;
+            if (vd.init?.kind === 'lambda' && vd.vartype) {
+                const lm = vd.init;
+                // ret_type from the explicit annotation on the lambda itself,
+                // OR extracted from the vartype annotation (e.g. "int | float (int, int)")
+                const retType = lm.ret_type ?? extractReturnType(vd.vartype);
+                if (retType && retType !== 'null' && !hasReturn(lm.body)) {
+                    diagnostics.push(buildDiag(lm.line - 1, lm.col - 1, `missing return statement in function with return type '${retType}'`, document));
+                }
+            }
+            walk(vd.init);
+            return;
+        }
+        if (n.kind === 'program') {
+            for (const stmt of n.body)
+                walk(stmt);
+            return;
+        }
+        if (n.kind === 'lambda') {
+            for (const stmt of n.body)
+                walk(stmt);
+            return;
+        }
+        for (const key of ['body', 'then_branch', 'else_branch', 'init', 'cond', 'update', 'expr', 'left', 'right', 'operand', 'value', 'true_branch', 'false_branch']) {
+            const child = n[key];
+            if (!child)
+                continue;
+            if (Array.isArray(child)) {
+                for (const c of child)
+                    walk(c);
+            }
+            else {
+                walk(child);
+            }
+        }
+    }
+    walk(node);
     return diagnostics;
 }
 // ── Document validation + AST extraction ──────────────────────────
@@ -372,6 +555,7 @@ function validateDocument(document) {
                 const importedBuiltins = parseSymbolImports(stripped);
                 docTypes.set(document.uri, collectTypes(ast, importedBuiltins));
                 diagnostics.push(...checkUnimportedBuiltins(stripped, importedBuiltins, document));
+                diagnostics.push(...checkMissingReturns(ast, document));
             }
             catch {
                 // AST parse failed — keep existing types
@@ -380,17 +564,6 @@ function validateDocument(document) {
         else {
             const stderr = astResult.stderr ?? '';
             diagnostics.push(...parseErrors(stderr, document));
-        }
-        // If no parse errors, run normally to get runtime errors
-        if (diagnostics.length === 0) {
-            const runResult = (0, child_process_1.spawnSync)(compilerPath, [tmpFile], {
-                encoding: 'utf-8',
-                timeout: 5000,
-            });
-            if (runResult.status !== 0) {
-                const stderr = runResult.stderr ?? '';
-                diagnostics.push(...parseErrors(stderr, document));
-            }
         }
         connection.sendDiagnostics({ uri: document.uri, diagnostics });
     }
@@ -416,14 +589,31 @@ connection.onHover((params) => {
     if (!word)
         return null;
     const typeStr = types.get(word);
-    if (!typeStr)
-        return null;
-    return {
-        contents: {
-            kind: node_1.MarkupKind.Markdown,
-            value: `\`\`\`symbol\n${word}: ${typeStr}\n\`\`\``,
-        },
-    };
+    if (typeStr) {
+        return {
+            contents: {
+                kind: node_1.MarkupKind.Markdown,
+                value: `\`\`\`symbol\n${word}: ${typeStr}\n\`\`\``,
+            },
+        };
+    }
+    // Hover over a builtin member: e.g. `write` in `console.write(...)`
+    const memberInfo = getMemberAccessAtPosition(document, params.position);
+    if (memberInfo) {
+        const objType = types.get(memberInfo.object);
+        if (objType) {
+            const memberType = extractMemberType(objType, memberInfo.member);
+            if (memberType) {
+                return {
+                    contents: {
+                        kind: node_1.MarkupKind.Markdown,
+                        value: `\`\`\`symbol\n${memberInfo.object}.${memberInfo.member}: ${memberType}\n\`\`\``,
+                    },
+                };
+            }
+        }
+    }
+    return null;
 });
 function getWordAtPosition(document, position) {
     const lineText = document.getText({
@@ -440,6 +630,32 @@ function getWordAtPosition(document, position) {
     if (start === end)
         return null;
     return lineText.slice(start, end);
+}
+// If the cursor is on a member in `object.member`, returns { object, member }.
+function getMemberAccessAtPosition(document, position) {
+    const lineText = document.getText({
+        start: { line: position.line, character: 0 },
+        end: { line: position.line, character: Number.MAX_SAFE_INTEGER },
+    });
+    const col = position.character;
+    let start = col;
+    let end = col;
+    while (start > 0 && isIdentChar(lineText[start - 1]))
+        start--;
+    while (end < lineText.length && isIdentChar(lineText[end]))
+        end++;
+    if (start === end || start === 0 || lineText[start - 1] !== '.')
+        return null;
+    const member = lineText.slice(start, end);
+    const dotPos = start - 1;
+    let objEnd = dotPos;
+    let objStart = objEnd;
+    while (objStart > 0 && isIdentChar(lineText[objStart - 1]))
+        objStart--;
+    if (objStart === objEnd)
+        return null;
+    const object = lineText.slice(objStart, objEnd);
+    return { object, member };
 }
 function isIdentChar(ch) {
     return /[a-zA-Z0-9_]/.test(ch);
