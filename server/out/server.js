@@ -7,11 +7,14 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const url_1 = require("url");
 const connection = (0, node_1.createConnection)(node_1.ProposedFeatures.all);
 const documents = new node_1.TextDocuments(vscode_languageserver_textdocument_1.TextDocument);
 let compilerPath = 'symboli';
 // Per-document type declarations: name → type string
 const docTypes = new Map();
+// Per-document definition locations: name → Location
+const docDefinitions = new Map();
 connection.onInitialize((params) => {
     compilerPath = params.initializationOptions?.compilerPath ?? 'symboli';
     loadBuiltinTypes(compilerPath);
@@ -19,6 +22,7 @@ connection.onInitialize((params) => {
         capabilities: {
             textDocumentSync: node_1.TextDocumentSyncKind.Incremental,
             hoverProvider: true,
+            definitionProvider: true,
             documentFormattingProvider: true,
         },
     };
@@ -28,6 +32,7 @@ documents.onDidChangeContent(change => validateDocument(change.document));
 documents.onDidClose(event => {
     connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
     docTypes.delete(event.document.uri);
+    docDefinitions.delete(event.document.uri);
 });
 // ── Builtin type signatures ───────────────────────────────────────
 const DEFAULT_BUILTIN_TYPES = {
@@ -305,6 +310,44 @@ function inferReturnTypes(node, types) {
         return;
     }
 }
+function collectDefinitions(node, uri, defs) {
+    if (!node)
+        return;
+    if (node.kind === 'var_decl') {
+        const vd = node;
+        defs.set(vd.name, {
+            uri,
+            range: {
+                start: { line: vd.line - 1, character: vd.col - 1 },
+                end: { line: vd.line - 1, character: vd.col - 1 + vd.name.length },
+            },
+        });
+        collectDefinitions(vd.init, uri, defs);
+        return;
+    }
+    if (node.kind === 'program') {
+        for (const stmt of node.body)
+            collectDefinitions(stmt, uri, defs);
+        return;
+    }
+    if (node.kind === 'lambda') {
+        for (const stmt of node.body)
+            collectDefinitions(stmt, uri, defs);
+        return;
+    }
+    for (const key of ['body', 'then', 'else', 'init', 'true_branch', 'false_branch']) {
+        const child = node[key];
+        if (!child)
+            continue;
+        if (Array.isArray(child)) {
+            for (const c of child)
+                collectDefinitions(c, uri, defs);
+        }
+        else {
+            collectDefinitions(child, uri, defs);
+        }
+    }
+}
 function collectTypes(ast, importedBuiltins) {
     const builtins = importedBuiltins
         ? Object.fromEntries(Object.entries(builtinTypes).filter(([k]) => importedBuiltins.has(k)))
@@ -370,6 +413,46 @@ function stripComments(source) {
         out.push(source[i++]);
     }
     return out.join('');
+}
+// Parse `import { a, b } from "./path.sym"` statements and resolve file paths.
+function parseFileImports(stripped, docPath) {
+    const imports = [];
+    const importRe = /import\s*\{([^}]+)\}\s*from\s*["']([^"']+)["']/g;
+    let m;
+    while ((m = importRe.exec(stripped)) !== null) {
+        const fromPath = m[2];
+        if (fromPath === 'symbol')
+            continue;
+        const names = m[1].split(',').map(n => n.trim()).filter(Boolean);
+        const dir = path.dirname(docPath);
+        let resolved = path.resolve(dir, fromPath);
+        if (!resolved.endsWith('.sym') && !fs.existsSync(resolved)) {
+            resolved += '.sym';
+        }
+        if (fs.existsSync(resolved)) {
+            imports.push({ names, resolvedPath: resolved });
+        }
+    }
+    return imports;
+}
+// Run --ast on a .sym file and return its collected types and definition locations.
+function loadFromFile(filePath) {
+    const result = (0, child_process_1.spawnSync)(compilerPath, ['--ast', filePath], {
+        encoding: 'utf-8',
+        timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout)
+        return { types: new Map(), defs: new Map() };
+    try {
+        const ast = JSON.parse(result.stdout);
+        const fileUri = (0, url_1.pathToFileURL)(filePath).href;
+        const defs = new Map();
+        collectDefinitions(ast, fileUri, defs);
+        return { types: collectTypes(ast), defs };
+    }
+    catch {
+        return { types: new Map(), defs: new Map() };
+    }
 }
 // Parse `import { a, b } from "symbol"` statements and return imported names.
 function parseSymbolImports(stripped) {
@@ -555,6 +638,22 @@ function validateDocument(document) {
                 const stripped = stripComments(document.getText());
                 const importedBuiltins = parseSymbolImports(stripped);
                 docTypes.set(document.uri, collectTypes(ast, importedBuiltins));
+                const types = docTypes.get(document.uri);
+                const defs = new Map();
+                collectDefinitions(ast, document.uri, defs);
+                const docPath = (0, url_1.fileURLToPath)(document.uri);
+                for (const fi of parseFileImports(stripped, docPath)) {
+                    const { types: importedTypes, defs: importedDefs } = loadFromFile(fi.resolvedPath);
+                    for (const name of fi.names) {
+                        const t = importedTypes.get(name);
+                        if (t)
+                            types.set(name, t);
+                        const loc = importedDefs.get(name);
+                        if (loc)
+                            defs.set(name, loc);
+                    }
+                }
+                docDefinitions.set(document.uri, defs);
                 diagnostics.push(...checkUnimportedBuiltins(stripped, importedBuiltins, document));
                 diagnostics.push(...checkMissingReturns(ast, document));
             }
@@ -615,6 +714,19 @@ connection.onHover((params) => {
         }
     }
     return null;
+});
+// ── Go to Definition ──────────────────────────────────────────────
+connection.onDefinition((params) => {
+    const defs = docDefinitions.get(params.textDocument.uri);
+    if (!defs)
+        return null;
+    const document = documents.get(params.textDocument.uri);
+    if (!document)
+        return null;
+    const word = getWordAtPosition(document, params.position);
+    if (!word)
+        return null;
+    return defs.get(word) ?? null;
 });
 function getWordAtPosition(document, position) {
     const lineText = document.getText({
