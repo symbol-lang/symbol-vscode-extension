@@ -545,6 +545,68 @@ function checkUnimportedBuiltins(stripped, imported, document) {
     }
     return diagnostics;
 }
+// ── Circular import detection ─────────────────────────────────────
+function hasTransitiveImport(fromFile, targetCanonical, visited) {
+    let canonical;
+    try {
+        canonical = fs.realpathSync(fromFile);
+    }
+    catch {
+        return false;
+    }
+    if (canonical === targetCanonical)
+        return true;
+    if (visited.has(canonical))
+        return false;
+    visited.add(canonical);
+    let content;
+    try {
+        content = fs.readFileSync(fromFile, 'utf-8');
+    }
+    catch {
+        return false;
+    }
+    const stripped = stripComments(content);
+    const importRe = /import\s*\{[^}]+\}\s*from\s*["']([^"']+)["']/g;
+    let m;
+    while ((m = importRe.exec(stripped)) !== null) {
+        const dep = m[1];
+        if (dep === 'symbol')
+            continue;
+        const resolved = path.resolve(path.dirname(fromFile), dep);
+        if (hasTransitiveImport(resolved, targetCanonical, visited))
+            return true;
+    }
+    return false;
+}
+function detectCircularImports(docPath, stripped, document) {
+    const diagnostics = [];
+    let docCanonical;
+    try {
+        docCanonical = fs.realpathSync(docPath);
+    }
+    catch {
+        return [];
+    }
+    const importRe = /import\s*\{[^}]+\}\s*from\s*["']([^"']+)["']/g;
+    let m;
+    while ((m = importRe.exec(stripped)) !== null) {
+        const fromPath = m[1];
+        if (fromPath === 'symbol')
+            continue;
+        const dir = path.dirname(docPath);
+        let resolved = path.resolve(dir, fromPath);
+        if (!resolved.endsWith('.sym') && !fs.existsSync(resolved))
+            resolved += '.sym';
+        if (!fs.existsSync(resolved))
+            continue;
+        if (hasTransitiveImport(resolved, docCanonical, new Set([docCanonical]))) {
+            const lineIdx = stripped.slice(0, m.index).split('\n').length - 1;
+            diagnostics.push(buildDiag(lineIdx, 0, `Circular import: '${fromPath}'`, document));
+        }
+    }
+    return diagnostics;
+}
 // ── Missing return check ──────────────────────────────────────────
 // Recursively check whether a body contains any return statement.
 function hasReturn(body) {
@@ -656,6 +718,7 @@ function validateDocument(document) {
                 docDefinitions.set(document.uri, defs);
                 diagnostics.push(...checkUnimportedBuiltins(stripped, importedBuiltins, document));
                 diagnostics.push(...checkMissingReturns(ast, document));
+                diagnostics.push(...detectCircularImports(docPath, stripped, document));
             }
             catch {
                 // AST parse failed — keep existing types

@@ -582,6 +582,58 @@ function checkUnimportedBuiltins(
   return diagnostics;
 }
 
+// ── Circular import detection ─────────────────────────────────────
+
+function hasTransitiveImport(fromFile: string, targetCanonical: string, visited: Set<string>): boolean {
+  let canonical: string;
+  try { canonical = fs.realpathSync(fromFile); } catch { return false; }
+
+  if (canonical === targetCanonical) return true;
+  if (visited.has(canonical)) return false;
+  visited.add(canonical);
+
+  let content: string;
+  try { content = fs.readFileSync(fromFile, 'utf-8'); } catch { return false; }
+
+  const stripped = stripComments(content);
+  const importRe = /import\s*\{[^}]+\}\s*from\s*["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = importRe.exec(stripped)) !== null) {
+    const dep = m[1];
+    if (dep === 'symbol') continue;
+    const resolved = path.resolve(path.dirname(fromFile), dep);
+    if (hasTransitiveImport(resolved, targetCanonical, visited)) return true;
+  }
+  return false;
+}
+
+function detectCircularImports(docPath: string, stripped: string, document: TextDocument): Diagnostic[] {
+  const diagnostics: Diagnostic[] = [];
+
+  let docCanonical: string;
+  try { docCanonical = fs.realpathSync(docPath); } catch { return []; }
+
+  const importRe = /import\s*\{[^}]+\}\s*from\s*["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = importRe.exec(stripped)) !== null) {
+    const fromPath = m[1];
+    if (fromPath === 'symbol') continue;
+
+    const dir = path.dirname(docPath);
+    let resolved = path.resolve(dir, fromPath);
+    if (!resolved.endsWith('.sym') && !fs.existsSync(resolved)) resolved += '.sym';
+    if (!fs.existsSync(resolved)) continue;
+
+    if (hasTransitiveImport(resolved, docCanonical, new Set([docCanonical]))) {
+      const lineIdx = stripped.slice(0, m.index).split('\n').length - 1;
+      diagnostics.push(buildDiag(lineIdx, 0, `Circular import: '${fromPath}'`, document));
+    }
+  }
+
+  return diagnostics;
+}
+
 // ── Missing return check ──────────────────────────────────────────
 
 // Recursively check whether a body contains any return statement.
@@ -698,6 +750,7 @@ function validateDocument(document: TextDocument): void {
 
         diagnostics.push(...checkUnimportedBuiltins(stripped, importedBuiltins, document));
         diagnostics.push(...checkMissingReturns(ast, document));
+        diagnostics.push(...detectCircularImports(docPath, stripped, document));
       } catch {
         // AST parse failed — keep existing types
       }
