@@ -38,7 +38,6 @@ Debug by pressing **F5** in VS Code to launch the Extension Development Host.
 The LSP server validates `.sym` files by:
 
 1. Running `symboli --ast <file>` to catch parse errors
-2. Running `symboli <file>` to catch type and runtime errors
-3. Converting error output to VS Code diagnostics
+2. Converting error output to VS Code diagnostics
 
 Errors are displayed as red squiggles on the problematic line.
