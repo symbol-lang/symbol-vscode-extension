@@ -10,6 +10,9 @@ import {
   Hover,
   MarkupKind,
   TextDocumentPositionParams,
+  DocumentFormattingParams,
+  TextEdit,
+  FormattingOptions,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { spawnSync } from 'child_process';
@@ -33,6 +36,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       hoverProvider: true,
+      documentFormattingProvider: true,
     },
   };
 });
@@ -101,7 +105,7 @@ const DEFAULT_BUILTIN_TYPES: Record<string, string> = {
   cast:    '{ to_bool: bool (any), to_string: string (any), to_int: int (any), to_float: float (any) }',
   string:  '{ length: int (string), lowercase: string (string), uppercase: string (string), trim: string (string), split: string[] (string, string), is_bool: bool (string), is_int: bool (string), is_float: bool (string) }',
   type:    '{ of: string (any) }',
-  file:    '{ exist: bool (string), create: null (string), delete: null (string), open: int | null (string), close: null (int), move: null (string, string), copy: null (string, string), read: any (string), write: null (int, string), append: null (int, string), read_bytes: int[] (int), write_bytes: null (int, int[]), size: int (string), mkdir: null (string) }',
+  file:    '{ exist: bool (string), create: null (string), delete: null (string), open: int | null (string), close: null (int), move: null (string, string), copy: null (string, string), read: any (string), write: null (int, string), append: null (int, string), read_bytes: int[] (int), write_bytes: null (int, int[]), eof: bool (int), size: int (string), mkdir: null (string) }',
 };
 
 let builtinTypes: Record<string, string> = { ...DEFAULT_BUILTIN_TYPES };
@@ -777,6 +781,242 @@ function buildDiag(
     message,
     source: 'symbol',
   };
+}
+
+// ── Document formatting ───────────────────────────────────────────
+
+connection.onDocumentFormatting((params: DocumentFormattingParams): TextEdit[] => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) return [];
+  const text = document.getText();
+  const formatted = formatSymbol(text, params.options);
+  if (formatted === text) return [];
+  return [{
+    range: {
+      start: { line: 0, character: 0 },
+      end: document.positionAt(text.length),
+    },
+    newText: formatted,
+  }];
+});
+
+function formatSymbol(source: string, options: FormattingOptions): string {
+  const indentUnit = options.insertSpaces !== false
+    ? ' '.repeat(options.tabSize ?? 4)
+    : '\t';
+
+  const lines = source.split('\n');
+  const output: string[] = [];
+  let depth = 0;
+  let pendingIndent = 0;
+  let prevBlank = false;
+  let inBlockComment = false;
+  let inMultilineString = false;
+  let mlStrChar = '';
+
+  for (const rawLine of lines) {
+    if (inMultilineString) {
+      output.push(rawLine);
+      const st = fmtScanStringState(rawLine, true, mlStrChar);
+      if (!st.inStr) { inMultilineString = false; mlStrChar = ''; }
+      continue;
+    }
+
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      if (!prevBlank && output.length > 0) output.push('');
+      prevBlank = true;
+      continue;
+    }
+    prevBlank = false;
+
+    if (inBlockComment) {
+      const lead = trimmed.startsWith('*') ? ' ' : '';
+      output.push(indentUnit.repeat(depth) + lead + trimmed);
+      if (trimmed.includes('*/')) inBlockComment = false;
+      continue;
+    }
+
+    if (trimmed.startsWith('/*') && !trimmed.includes('*/')) {
+      inBlockComment = true;
+    }
+
+    const leadingCloses = fmtCountLeadingClosingBraces(trimmed);
+    depth = Math.max(0, depth - leadingCloses);
+
+    // A `}` cancels the pending indent from a braceless control flow
+    const effectiveDepth = leadingCloses > 0 ? depth : depth + pendingIndent;
+    pendingIndent = 0;
+
+    output.push(indentUnit.repeat(effectiveDepth) + fmtLine(trimmed));
+
+    const { opens, closes } = fmtCountBraces(trimmed);
+    depth = Math.max(0, depth + opens - (closes - leadingCloses));
+
+    const strState = fmtScanStringState(trimmed, false, '');
+    if (strState.inStr) {
+      inMultilineString = true;
+      mlStrChar = strState.strChar;
+    } else if (fmtIsBracelessControlFlow(trimmed)) {
+      pendingIndent = 1;
+    }
+  }
+
+  while (output.length > 0 && output[output.length - 1] === '') output.pop();
+
+  return output.join('\n') + (source.endsWith('\n') ? '\n' : '');
+}
+
+function fmtScanStringState(line: string, startInStr: boolean, startChar: string): { inStr: boolean; strChar: string } {
+  let inStr = startInStr;
+  let strChar = startChar;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === strChar) inStr = false;
+    } else {
+      if (ch === '"' || ch === "'") { inStr = true; strChar = ch; }
+      else if (ch === '/' && line[i + 1] === '/') break;
+    }
+  }
+  return { inStr, strChar };
+}
+
+function fmtIsBracelessControlFlow(line: string): boolean {
+  if (line.endsWith('{') || line.endsWith('}')) return false;
+  if (/^else\s*$/.test(line)) return true;
+  if (/^(case\s|default\s*:)/.test(line) && line.endsWith(':')) return true;
+  if (!/^(if|else\s+if|for|while)\s*\(/.test(line)) return false;
+
+  // Find matching closing paren of the condition
+  let depth = 0;
+  let inStr = false, strChar = '';
+  for (let i = line.indexOf('('); i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === '\\') i++;
+      else if (ch === strChar) inStr = false;
+    } else if (ch === '"' || ch === "'") {
+      inStr = true; strChar = ch;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      if (--depth === 0) {
+        // If there's a body after the condition paren, it's already on this line
+        return line.slice(i + 1).trim().length === 0;
+      }
+    }
+  }
+  return false;
+}
+
+function fmtCountLeadingClosingBraces(line: string): number {
+  let count = 0;
+  for (const ch of line) {
+    if (ch === '}') count++;
+    else break;
+  }
+  return count;
+}
+
+function fmtCountBraces(line: string): { opens: number; closes: number } {
+  let opens = 0, closes = 0;
+  let inStr = false, strChar = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === strChar) inStr = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = true; strChar = ch; continue; }
+    if (ch === '/' && line[i + 1] === '/') break;
+    if (ch === '{') opens++;
+    else if (ch === '}') closes++;
+  }
+  return { opens, closes };
+}
+
+function fmtLine(line: string): string {
+  if (
+    line.startsWith('//') ||
+    line.startsWith('*') ||
+    line.startsWith('/*') ||
+    line === '*/'
+  ) return line;
+
+  // Separate trailing inline comment
+  let comment = '';
+  const ci = fmtFindCommentStart(line);
+  if (ci !== -1) {
+    comment = '  ' + line.slice(ci);
+    line = line.slice(0, ci).trimEnd();
+  }
+
+  const { masked, literals } = fmtMaskStrings(line);
+  let s = masked;
+
+  // Normalize import/export brace spacing: {a,b} → { a, b }
+  if (/^(import|export)\b/.test(s)) {
+    s = s.replace(/\{([^}]*)\}/g, (_, inner) => {
+      const items = inner.split(',').map((x: string) => x.trim()).filter(Boolean);
+      return '{ ' + items.join(', ') + ' }';
+    });
+  }
+
+  // Normalize comma spacing: remove extra spaces around comma, then ensure one space after
+  s = s.replace(/\s*,\s*/g, ', ');
+  // Remove spurious trailing space before closing bracket/paren
+  s = s.replace(/,\s*([)\]])/g, ', $1');
+
+  line = fmtRestoreStrings(s, literals);
+  return line + comment;
+}
+
+function fmtFindCommentStart(line: string): number {
+  let inStr = false, strChar = '';
+  for (let i = 0; i < line.length - 1; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === strChar) inStr = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = true; strChar = ch; continue; }
+    if (ch === '/' && line[i + 1] === '/') return i;
+  }
+  return -1;
+}
+
+function fmtMaskStrings(line: string): { masked: string; literals: string[] } {
+  const literals: string[] = [];
+  let result = '';
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === '"' || ch === "'") {
+      const q = ch;
+      let str = q;
+      i++;
+      while (i < line.length && line[i] !== q) {
+        if (line[i] === '\\') str += line[i++];
+        str += line[i++];
+      }
+      if (i < line.length) str += line[i++];
+      result += `\x00${literals.length}\x00`;
+      literals.push(str);
+    } else {
+      result += ch;
+      i++;
+    }
+  }
+  return { masked: result, literals };
+}
+
+function fmtRestoreStrings(s: string, literals: string[]): string {
+  return s.replace(/\x00(\d+)\x00/g, (_, i) => literals[+i]);
 }
 
 documents.listen(connection);
